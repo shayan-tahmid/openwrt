@@ -1,0 +1,507 @@
+cat << 'EOF' > /www/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Router Control Panel</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-dim: #94a3b8;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --success: #10b981;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 20px; line-height: 1.5; }
+    .container { max-width: 1000px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+    h1 { font-size: 1.4rem; font-weight: 700; color: #fff; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+    .badge-online { background: rgba(16,185,129,0.2); color: var(--success); }
+    .badge-offline { background: rgba(239,68,68,0.2); color: var(--danger); }
+    .badge-warn { background: rgba(245,158,11,0.2); color: var(--warning); }
+    
+    .tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+    .tab-btn { background: var(--card); border: 1px solid var(--border); color: var(--text-dim); padding: 10px 18px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s; }
+    .tab-btn.active, .tab-btn:hover { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    .card h2 { font-size: 1.1rem; margin-bottom: 15px; color: #fff; display: flex; align-items: center; justify-content: space-between; }
+    
+    .info-banner { background: #0b1120; border-left: 4px solid var(--primary); padding: 12px 16px; border-radius: 4px; margin-bottom: 15px; font-size: 0.9rem; }
+    .info-banner strong { color: #fff; }
+
+    .form-group { margin-bottom: 15px; }
+    label { display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 6px; }
+    input, select { width: 100%; padding: 10px 12px; background: #0b1120; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.9rem; }
+    input:focus, select:focus { outline: none; border-color: var(--primary); }
+    .btn { background: var(--primary); color: #fff; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s; font-size: 0.85rem; }
+    .btn:hover { background: var(--primary-hover); }
+    .btn-warn { background: var(--warning); color: #000; }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--text-dim); font-weight: 600; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .ports-grid { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 15px; }
+    .port-item { background: #0b1120; border: 2px solid var(--border); border-radius: 8px; padding: 14px 10px; width: 135px; text-align: center; }
+    .port-item.link-up { border-color: var(--success); }
+    .port-name { font-weight: 700; margin-bottom: 5px; font-size: 0.9rem; }
+    .port-status { font-size: 0.75rem; color: var(--text-dim); }
+
+    #wifi-modal {
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(4px);
+      display: none; align-items: center; justify-content: center; z-index: 2000;
+    }
+    .modal-box {
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      padding: 30px; max-width: 480px; width: 90%; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    .countdown-circle { font-size: 2.2rem; font-weight: bold; color: var(--primary); margin: 15px 0; }
+    #toast { position: fixed; bottom: 20px; right: 20px; background: var(--card); border: 1px solid var(--border); padding: 12px 20px; border-radius: 6px; display: none; z-index: 1000; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <div>
+      <h1 id="sys-model">OpenWrt Router</h1>
+      <span style="font-size: 0.8rem; color: var(--text-dim)" id="sys-info">Loading...</span>
+    </div>
+    <div>
+      <span class="badge badge-online" id="wan-status-badge">WAN: Checking...</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" onclick="showTab('tab-status')">Overview</button>
+    <button class="tab-btn" onclick="showTab('tab-wifi')">Wi-Fi Settings</button>
+    <button class="tab-btn" onclick="showTab('tab-devices')">Connected Devices</button>
+    <button class="tab-btn" onclick="showTab('tab-wan')">WAN Protocol</button>
+    <button class="tab-btn" onclick="showTab('tab-switch')">Virtual Switch / Ports</button>
+  </nav>
+
+  <!-- TAB 1: OVERVIEW -->
+  <div id="tab-status" class="panel active">
+    <div class="card">
+      <h2>Router Overview</h2>
+      <p style="margin-bottom: 8px;"><strong>Hostname:</strong> <span id="stat-hostname">-</span></p>
+      <p style="margin-bottom: 8px;"><strong>Uptime:</strong> <span id="stat-uptime">-</span></p>
+      <p style="margin-bottom: 8px;"><strong>WAN IP Address:</strong> <span id="stat-wan-ip">-</span></p>
+      <p style="margin-bottom: 8px;"><strong>WAN Protocol:</strong> <span id="stat-wan-proto">-</span></p>
+      <p><strong>Current Active WAN Port:</strong> <span class="badge badge-warn" id="stat-wan-active-port">-</span></p>
+    </div>
+  </div>
+
+  <!-- TAB 2: WI-FI -->
+  <div id="tab-wifi" class="panel">
+    <div id="wifi-container">Loading Wi-Fi Radios...</div>
+  </div>
+
+  <!-- TAB 3: DEVICES & ACCESS CONTROL -->
+  <div id="tab-devices" class="panel">
+    <div class="card">
+      <h2>
+        Connected Clients & Access Control
+        <button class="btn btn-outline" onclick="loadDevices()">Refresh</button>
+      </h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Hostname</th>
+            <th>IP Address</th>
+            <th>MAC Address</th>
+            <th>Connection</th>
+            <th>Signal</th>
+            <th>Internet Access</th>
+          </tr>
+        </thead>
+        <tbody id="devices-tbody">
+          <tr><td colspan="6">Scanning clients...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB 4: WAN CONFIG -->
+  <div id="tab-wan" class="panel">
+    <div class="card">
+      <h2>WAN Connection Protocol</h2>
+      <div class="form-group">
+        <label>Protocol Mode</label>
+        <select id="wan-proto-select" onchange="toggleWanFields()">
+          <option value="dhcp">DHCP Client (Automatic IP)</option>
+          <option value="static">Static IP</option>
+          <option value="pppoe">PPPoE (DSL / Fiber ONT)</option>
+        </select>
+      </div>
+
+      <div id="wan-static-fields" style="display:none;">
+        <div class="form-group">
+          <label>IPv4 Address</label>
+          <input type="text" id="wan-ip" placeholder="192.168.1.100">
+        </div>
+        <div class="form-group">
+          <label>Subnet Mask</label>
+          <input type="text" id="wan-mask" placeholder="255.255.255.0">
+        </div>
+        <div class="form-group">
+          <label>Gateway</label>
+          <input type="text" id="wan-gw" placeholder="192.168.1.1">
+        </div>
+        <div class="form-group">
+          <label>Custom DNS (space separated)</label>
+          <input type="text" id="wan-dns" placeholder="1.1.1.1 8.8.8.8">
+        </div>
+      </div>
+
+      <div id="wan-pppoe-fields" style="display:none;">
+        <div class="form-group">
+          <label>PPPoE Username</label>
+          <input type="text" id="wan-user" placeholder="Username">
+        </div>
+        <div class="form-group">
+          <label>PPPoE Password</label>
+          <input type="password" id="wan-pass" placeholder="Password">
+        </div>
+      </div>
+
+      <button class="btn" onclick="saveWan()">Save & Apply WAN</button>
+    </div>
+  </div>
+
+  <!-- TAB 5: VIRTUAL SWITCH & PORT ASSIGNMENT -->
+  <div id="tab-switch" class="panel">
+    <div class="card">
+      <h2>Physical Switch Ports (switch0 - rt305x)</h2>
+      <div class="info-banner">
+        Current WAN Port: <strong id="switch-banner-wan-name">Detecting...</strong>
+      </div>
+      <p style="color: var(--text-dim); font-size: 0.85rem;">Live port states from the hardware switch:</p>
+      <div class="ports-grid" id="switch-ports-grid">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Physical Port Assignment (VLAN Mapping)</h2>
+      <p style="color: var(--text-dim); font-size: 0.85rem; margin-bottom: 15px;">
+        Assign any port as the WAN interface. The selected port will be isolated into <strong>VLAN 2 (WAN)</strong>, and all other ports will be placed into <strong>VLAN 1 (LAN)</strong>.
+      </p>
+      
+      <div class="form-group">
+        <label>Select Physical Port for WAN</label>
+        <select id="wan-port-select">
+          <option value="0">WAN Port (Physical Jack: WAN - Port 0)</option>
+          <option value="1">LAN 1 (Physical Jack: LAN 1 - Port 1)</option>
+          <option value="2">LAN 2 (Physical Jack: LAN 2 - Port 2)</option>
+          <option value="3">LAN 3 (Physical Jack: LAN 3 - Port 3)</option>
+          <option value="4">LAN 4 (Physical Jack: LAN 4 - Port 4)</option>
+          <option value="none">Disabled / Bridge all to LAN (Dumb AP Mode)</option>
+        </select>
+      </div>
+
+      <button class="btn btn-warn" onclick="applyPortSwitch()">Apply Port Assignment</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Dialog when Wi-Fi is Saved -->
+<div id="wifi-modal">
+  <div class="modal-box">
+    <h2 style="color: #fff; margin-bottom: 10px;">Wi-Fi Reloading</h2>
+    <p style="color: var(--text-dim); font-size: 0.9rem;">
+      Settings committed to flash. The wireless radio is reloading in the background.
+    </p>
+    <div class="countdown-circle" id="modal-timer">15</div>
+    <div style="background: #0b1120; padding: 12px; border-radius: 6px; text-align: left; font-size: 0.85rem; margin-bottom: 15px;">
+      <p><strong>New SSID:</strong> <span id="modal-ssid">-</span></p>
+      <p><strong>Security:</strong> <span id="modal-sec">-</span></p>
+    </div>
+    <p style="color: var(--warning); font-size: 0.85rem; margin-bottom: 15px;">
+      ⚠️ If connected via Wi-Fi, reconnect using your updated credentials.
+    </p>
+    <button class="btn" onclick="closeWifiModal()">Dismiss</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.innerText = msg;
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 4000);
+}
+
+function showTab(tabId) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  event.target.classList.add('active');
+
+  if (tabId === 'tab-status') loadStatus();
+  if (tabId === 'tab-wifi') loadWifi();
+  if (tabId === 'tab-devices') loadDevices();
+  if (tabId === 'tab-wan') loadWan();
+  if (tabId === 'tab-switch') loadSwitch();
+}
+
+// 1. Status
+async function loadStatus() {
+  const res = await fetch('/cgi-bin/api?action=status');
+  const d = await res.json();
+  if (d.status === 'ok') {
+    document.getElementById('sys-model').innerText = d.model || 'OpenWrt Router';
+    document.getElementById('sys-info').innerText = `Host: ${d.hostname}`;
+    document.getElementById('stat-hostname').innerText = d.hostname;
+    document.getElementById('stat-wan-ip').innerText = d.wan_ip;
+    document.getElementById('stat-wan-proto').innerText = d.wan_proto.toUpperCase();
+    document.getElementById('stat-wan-active-port').innerText = d.active_wan_name;
+
+    const h = Math.floor(d.uptime / 3600);
+    const m = Math.floor((d.uptime % 3600) / 60);
+    document.getElementById('stat-uptime').innerText = `${h} hrs, ${m} mins`;
+
+    const badge = document.getElementById('wan-status-badge');
+    badge.innerText = `WAN: ${d.wan_ip}`;
+    badge.className = (d.wan_ip !== 'Disconnected') ? 'badge badge-online' : 'badge badge-offline';
+  }
+}
+
+// 2. Wi-Fi
+async function loadWifi() {
+  const res = await fetch('/cgi-bin/api?action=get_wifi');
+  const d = await res.json();
+  const c = document.getElementById('wifi-container');
+  if (d.status === 'ok' && d.networks.length > 0) {
+    c.innerHTML = d.networks.map(n => `
+      <div class="card">
+        <h2>${n.device.toUpperCase()} (${n.band})</h2>
+        <div class="form-group">
+          <label>Network Name (SSID)</label>
+          <input type="text" id="ssid-${n.section}" value="${n.ssid}">
+        </div>
+        <div class="form-group">
+          <label>Security</label>
+          <select id="enc-${n.section}" onchange="toggleWifiFields('${n.section}')">
+            <option value="psk2" ${n.encryption === 'psk2' ? 'selected' : ''}>WPA2-PSK (Strong Password)</option>
+            <option value="none" ${n.encryption === 'none' ? 'selected' : ''}>None (Open / No Password)</option>
+          </select>
+        </div>
+        <div class="form-group" id="pass-group-${n.section}" style="display: ${n.encryption === 'none' ? 'none' : 'block'};">
+          <label>Wi-Fi Password (min. 8 characters)</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="password" id="key-${n.section}" value="${n.key}">
+            <button type="button" class="btn btn-outline" onclick="togglePassVisibility('${n.section}')">Show</button>
+          </div>
+        </div>
+        <button class="btn" onclick="saveWifi('${n.section}')">Save & Apply Changes</button>
+      </div>
+    `).join('');
+  } else {
+    c.innerHTML = '<div class="card"><p>No wireless radios detected.</p></div>';
+  }
+}
+
+function toggleWifiFields(section) {
+  const enc = document.getElementById(`enc-${section}`).value;
+  document.getElementById(`pass-group-${section}`).style.display = (enc === 'none') ? 'none' : 'block';
+}
+
+function togglePassVisibility(section) {
+  const inp = document.getElementById(`key-${section}`);
+  inp.type = (inp.type === 'password') ? 'text' : 'password';
+}
+
+async function saveWifi(section) {
+  const ssid = document.getElementById(`ssid-${section}`).value.trim();
+  const encryption = document.getElementById(`enc-${section}`).value;
+  const key = document.getElementById(`key-${section}`).value.trim();
+
+  if (!ssid) return alert("SSID cannot be empty.");
+  if (encryption === 'psk2' && key.length < 8) return alert("WPA2-PSK password must be at least 8 characters.");
+
+  document.getElementById('modal-ssid').innerText = ssid;
+  document.getElementById('modal-sec').innerText = (encryption === 'none') ? 'Open (No password)' : 'WPA2-PSK';
+  document.getElementById('wifi-modal').style.display = 'flex';
+
+  let countdown = 15;
+  const timerElem = document.getElementById('modal-timer');
+  timerElem.innerText = countdown;
+  const interval = setInterval(() => {
+    countdown--;
+    timerElem.innerText = countdown;
+    if (countdown <= 0) clearInterval(interval);
+  }, 1000);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 4000);
+
+  try {
+    await fetch('/cgi-bin/api?action=set_wifi', {
+      method: 'POST',
+      body: JSON.stringify({ section, ssid, encryption, key }),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+  } catch (err) {
+    console.log("Wi-Fi restarting:", err);
+  }
+}
+
+function closeWifiModal() {
+  document.getElementById('wifi-modal').style.display = 'none';
+}
+
+// 3. Devices & Firewall Blocking
+async function loadDevices() {
+  const tb = document.getElementById('devices-tbody');
+  tb.innerHTML = '<tr><td colspan="6">Scanning...</td></tr>';
+  const res = await fetch('/cgi-bin/api?action=get_devices');
+  const d = await res.json();
+  if (d.status === 'ok' && d.devices.length > 0) {
+    tb.innerHTML = d.devices.map(dev => `
+      <tr>
+        <td><strong>${dev.hostname}</strong></td>
+        <td>${dev.ip}</td>
+        <td><code>${dev.mac}</code></td>
+        <td><span class="badge ${dev.type.includes('Wi-Fi') ? 'badge-warn' : 'badge-online'}">${dev.type}</span></td>
+        <td>${dev.signal !== 'N/A' ? dev.signal + ' dBm' : '-'}</td>
+        <td>
+          ${dev.blocked === 1 
+            ? `<button class="btn btn-warn" onclick="unblockDevice('${dev.mac}')">Unblock</button>
+               <span class="badge badge-offline" style="margin-left: 6px;">Blocked</span>` 
+            : `<button class="btn btn-danger" onclick="confirmBlockDevice('${dev.mac}', '${dev.hostname}')">Block</button>`
+          }
+        </td>
+      </tr>
+    `).join('');
+  } else {
+    tb.innerHTML = '<tr><td colspan="6">No active DHCP leases detected.</td></tr>';
+  }
+}
+
+async function confirmBlockDevice(mac, host) {
+  if (!confirm(`Are you sure you want to block internet access for ${host} (${mac})?`)) return;
+
+  showToast(`Blocking traffic for ${mac}...`);
+  const res = await fetch('/cgi-bin/api?action=block_client', {
+    method: 'POST',
+    body: JSON.stringify({ mac })
+  });
+  const d = await res.json();
+  showToast(d.message);
+  setTimeout(loadDevices, 1000);
+}
+
+async function unblockDevice(mac) {
+  showToast(`Unblocking device ${mac}...`);
+  const res = await fetch('/cgi-bin/api?action=unblock_client', {
+    method: 'POST',
+    body: JSON.stringify({ mac })
+  });
+  const d = await res.json();
+  showToast(d.message);
+  setTimeout(loadDevices, 1000);
+}
+
+// 4. WAN Configuration
+async function loadWan() {
+  const res = await fetch('/cgi-bin/api?action=get_wan');
+  const d = await res.json();
+  if (d.status === 'ok') {
+    document.getElementById('wan-proto-select').value = d.proto;
+    document.getElementById('wan-ip').value = d.ipaddr;
+    document.getElementById('wan-mask').value = d.netmask;
+    document.getElementById('wan-gw').value = d.gateway;
+    document.getElementById('wan-dns').value = d.dns;
+    document.getElementById('wan-user').value = d.username;
+    toggleWanFields();
+  }
+}
+
+function toggleWanFields() {
+  const proto = document.getElementById('wan-proto-select').value;
+  document.getElementById('wan-static-fields').style.display = (proto === 'static') ? 'block' : 'none';
+  document.getElementById('wan-pppoe-fields').style.display = (proto === 'pppoe') ? 'block' : 'none';
+}
+
+async function saveWan() {
+  const proto = document.getElementById('wan-proto-select').value;
+  const payload = {
+    proto,
+    ipaddr: document.getElementById('wan-ip').value,
+    netmask: document.getElementById('wan-mask').value,
+    gateway: document.getElementById('wan-gw').value,
+    dns: document.getElementById('wan-dns').value,
+    username: document.getElementById('wan-user').value,
+    password: document.getElementById('wan-pass').value
+  };
+  showToast('Updating WAN interface in background...');
+  await fetch('/cgi-bin/api?action=set_wan', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+// 5. Switch & Port Assignment (Fixed Port Mapping)
+async function loadSwitch() {
+  const res = await fetch('/cgi-bin/api?action=get_switch');
+  const d = await res.json();
+  if (d.status === 'ok') {
+    // Show current WAN port clearly in banner
+    document.getElementById('switch-banner-wan-name').innerText = d.active_wan_name;
+
+    // Render live ports
+    const grid = document.getElementById('switch-ports-grid');
+    grid.innerHTML = d.ports.map(p => `
+      <div class="port-item ${p.link === 1 ? 'link-up' : ''}">
+        <div class="port-name">${p.name}</div>
+        <span class="badge ${p.role === 'WAN' ? 'badge-offline' : (p.role === 'CPU' ? 'badge-warn' : 'badge-online')}">${p.role}</span>
+        <div class="port-status" style="margin-top: 8px;">
+          ${p.speed}
+        </div>
+      </div>
+    `).join('');
+
+    // Pre-select current WAN port in dropdown
+    document.getElementById('wan-port-select').value = d.active_wan_port;
+  }
+}
+
+async function applyPortSwitch() {
+  const selectedPort = document.getElementById('wan-port-select').value;
+  const label = document.getElementById('wan-port-select').selectedOptions[0].text;
+
+  if (!confirm(`Apply port reassignment?\n\nTarget WAN: ${label}\n\nThis will reconfigure switch VLANs and restart network interfaces.`)) return;
+
+  showToast("Reconfiguring switch VLANs in background... Network restarting.");
+  await fetch('/cgi-bin/api?action=set_switch', {
+    method: 'POST',
+    body: JSON.stringify({ wan_port: selectedPort })
+  });
+  setTimeout(loadSwitch, 4000);
+}
+
+// Initial load
+loadStatus();
+</script>
+</body>
+</html>
+EOF
