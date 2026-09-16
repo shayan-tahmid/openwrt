@@ -1,0 +1,378 @@
+cat << 'EOF' > /www/cgi-bin/api
+#!/bin/sh
+printf "Content-Type: application/json\r\n\r\n"
+
+read_body() {
+    if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ]; then
+        head -c "$CONTENT_LENGTH" 2>/dev/null
+    fi
+}
+
+# Helper to find current active WAN port from VLAN 2
+get_active_wan_port() {
+    V2_SEC=""
+    for s in $(uci show network | grep "=switch_vlan" | cut -d'.' -f2 | cut -d'=' -f1); do
+        v=$(uci -q get "network.${s}.vlan")
+        [ -z "$v" ] && v=$(uci -q get "network.${s}.vid")
+        [ "$v" = "2" ] && V2_SEC="$s" && break
+    done
+
+    WAN_DISABLED=$(uci -q get network.wan.disabled || echo "0")
+    if [ "$WAN_DISABLED" = "1" ] || [ -z "$V2_SEC" ]; then
+        echo "none"
+        return
+    fi
+
+    V2_PORTS=$(uci -q get "network.${V2_SEC}.ports")
+    for p in $V2_PORTS; do
+        if [ "$p" != "6t" ] && [ "$p" != "6" ]; then
+            echo "$p"
+            return
+        fi
+    done
+    echo "none"
+}
+
+port_to_name() {
+    case "$1" in
+        0) echo "WAN (Port 0)" ;;
+        1) echo "LAN 1 (Port 1)" ;;
+        2) echo "LAN 2 (Port 2)" ;;
+        3) echo "LAN 3 (Port 3)" ;;
+        4) echo "LAN 4 (Port 4)" ;;
+        none) echo "Disabled / Bridged to LAN" ;;
+        *) echo "Unknown ($1)" ;;
+    esac
+}
+
+ACTION=$(echo "$QUERY_STRING" | sed -n 's/.*action=\([^&]*\).*/\1/p')
+[ -z "$ACTION" ] && ACTION="status"
+
+case "$ACTION" in
+    # -------------------------------------------------------------
+    # 1. OVERVIEW & STATUS (Includes Active WAN Port)
+    # -------------------------------------------------------------
+    status)
+        HOSTNAME=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+        MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || ubus call system board 2>/dev/null | jsonfilter -e '@.model')
+        UPTIME=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+        WAN_IP=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+        [ -z "$WAN_IP" ] && WAN_IP="Disconnected"
+        WAN_PROTO=$(uci -q get network.wan.proto || echo "dhcp")
+
+        WAN_P=$(get_active_wan_port)
+        WAN_P_NAME=$(port_to_name "$WAN_P")
+
+        printf '{"status":"ok","hostname":"%s","model":"%s","uptime":%d,"wan_ip":"%s","wan_proto":"%s","active_wan_port":"%s","active_wan_name":"%s"}' \
+            "$HOSTNAME" "$MODEL" "$UPTIME" "$WAN_IP" "$WAN_PROTO" "$WAN_P" "$WAN_P_NAME"
+        ;;
+
+    # -------------------------------------------------------------
+    # 2. WI-FI MANAGEMENT (Background Execution)
+    # -------------------------------------------------------------
+    get_wifi)
+        printf '{"status":"ok","networks":['
+        first=1
+        for iface in $(uci show wireless | grep "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+            SSID=$(uci -q get "wireless.${iface}.ssid")
+            KEY=$(uci -q get "wireless.${iface}.key")
+            DEVICE=$(uci -q get "wireless.${iface}.device")
+            ENC=$(uci -q get "wireless.${iface}.encryption" || echo "none")
+            DISABLED=$(uci -q get "wireless.${iface}.disabled" || echo "0")
+            BAND=$(uci -q get "wireless.${DEVICE}.band" || echo "2.4GHz")
+
+            case "$ENC" in
+                *none*|"") SEC_MODE="none" ;;
+                *)         SEC_MODE="psk2" ;;
+            esac
+
+            [ $first -eq 0 ] && printf ','
+            first=0
+            printf '{"section":"%s","device":"%s","band":"%s","ssid":"%s","key":"%s","encryption":"%s","disabled":"%s"}' \
+                "$iface" "$DEVICE" "$BAND" "$SSID" "$KEY" "$SEC_MODE" "$DISABLED"
+        done
+        printf ']}'
+        ;;
+
+    set_wifi)
+        BODY=$(read_body)
+        SEC=$(echo "$BODY" | jsonfilter -e '@.section')
+        SSID=$(echo "$BODY" | jsonfilter -e '@.ssid' | tr -d "'\r\n")
+        ENC=$(echo "$BODY" | jsonfilter -e '@.encryption')
+        KEY=$(echo "$BODY" | jsonfilter -e '@.key' | tr -d "'\r\n")
+
+        if [ -n "$SEC" ] && [ -n "$SSID" ]; then
+            uci -q set wireless."$SEC".ssid="$SSID"
+            if [ "$ENC" = "none" ]; then
+                uci -q set wireless."$SEC".encryption="none"
+                uci -q delete wireless."$SEC".key
+            else
+                uci -q set wireless."$SEC".encryption="psk2"
+                uci -q set wireless."$SEC".key="$KEY"
+            fi
+            uci commit wireless
+
+            printf '{"status":"ok","message":"Wi-Fi settings applied."}\n'
+            (sleep 1 && /sbin/wifi reload >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+        else
+            printf '{"status":"error","message":"Invalid parameters."}'
+        fi
+        ;;
+
+    # -------------------------------------------------------------
+    # 3. CONNECTED DEVICES & ACCESS CONTROL
+    # -------------------------------------------------------------
+    get_devices)
+        printf '{"status":"ok","devices":['
+        first=1
+        WIFI_CLIENTS="/tmp/assoc_clients.$$"
+        rm -f "$WIFI_CLIENTS"
+
+        for wlan in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+            iw dev "$wlan" station dump 2>/dev/null | awk -v iface="$wlan" '
+                $1=="Station" {mac=tolower($2)}
+                $1=="signal:" {print mac, iface, $2, $3}
+            ' >> "$WIFI_CLIENTS"
+        done
+
+        BLOCKED_MACS="/tmp/blocked_macs.$$"
+        rm -f "$BLOCKED_MACS"
+        for r in $(uci show firewall | grep "=rule" | cut -d'.' -f2 | cut -d'=' -f1); do
+            target=$(uci -q get "firewall.${r}.target")
+            sm=$(uci -q get "firewall.${r}.src_mac" | tr '[:upper:]' '[:lower:]')
+            enabled=$(uci -q get "firewall.${r}.enabled" || echo "1")
+            if [ "$target" = "REJECT" ] && [ -n "$sm" ] && [ "$enabled" = "1" ]; then
+                echo "$sm" >> "$BLOCKED_MACS"
+            fi
+        done
+
+        if [ -f /tmp/dhcp.leases ]; then
+            while read -r ts mac ip hostname clid; do
+                [ -z "$ip" ] && continue
+                mac_clean=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+                [ "$hostname" = "*" ] && hostname="Unknown"
+
+                wifi_info=$(grep "^$mac_clean" "$WIFI_CLIENTS" 2>/dev/null | head -n1)
+                if [ -n "$wifi_info" ]; then
+                    iface_name=$(echo "$wifi_info" | awk '{print $2}')
+                    sig=$(echo "$wifi_info" | awk '{print $3}')
+                    con_type="Wi-Fi (${iface_name})"
+                else
+                    sig="N/A"
+                    con_type="Ethernet (LAN)"
+                fi
+
+                is_blocked=0
+                grep -qi "^$mac_clean" "$BLOCKED_MACS" 2>/dev/null && is_blocked=1
+
+                [ $first -eq 0 ] && printf ','
+                first=0
+                printf '{"ip":"%s","mac":"%s","hostname":"%s","type":"%s","signal":"%s","blocked":%d}' \
+                    "$ip" "$mac_clean" "$hostname" "$con_type" "$sig" "$is_blocked"
+            done < /tmp/dhcp.leases
+        fi
+        rm -f "$WIFI_CLIENTS" "$BLOCKED_MACS"
+        printf ']}'
+        ;;
+
+    block_client)
+        BODY=$(read_body)
+        MAC=$(echo "$BODY" | jsonfilter -e '@.mac' | tr '[:upper:]' '[:lower:]' | tr -d "'\r\n")
+
+        if [ -n "$MAC" ]; then
+            RULE_SEC=""
+            for r in $(uci show firewall | grep "=rule" | cut -d'.' -f2 | cut -d'=' -f1); do
+                sm=$(uci -q get "firewall.${r}.src_mac" | tr '[:upper:]' '[:lower:]')
+                if [ "$sm" = "$MAC" ]; then
+                    RULE_SEC="$r"
+                    break
+                fi
+            done
+
+            if [ -n "$RULE_SEC" ]; then
+                uci set firewall."$RULE_SEC".enabled='1'
+                uci set firewall."$RULE_SEC".target='REJECT'
+            else
+                RULE_SEC=$(uci add firewall rule)
+                mac_alias=$(echo "$MAC" | tr ':' '_')
+                uci set firewall."$RULE_SEC".name="Block_${mac_alias}"
+                uci set firewall."$RULE_SEC".src='lan'
+                uci set firewall."$RULE_SEC".dest='wan'
+                uci set firewall."$RULE_SEC".src_mac="$MAC"
+                uci set firewall."$RULE_SEC".target='REJECT'
+                uci set firewall."$RULE_SEC".enabled='1'
+            fi
+            uci commit firewall
+
+            printf '{"status":"ok","message":"Traffic from device blocked."}\n'
+            (sleep 1 && /etc/init.d/firewall reload >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+        else
+            printf '{"status":"error","message":"Invalid MAC address."}'
+        fi
+        ;;
+
+    unblock_client)
+        BODY=$(read_body)
+        MAC=$(echo "$BODY" | jsonfilter -e '@.mac' | tr '[:upper:]' '[:lower:]' | tr -d "'\r\n")
+
+        if [ -n "$MAC" ]; then
+            for r in $(uci show firewall | grep "=rule" | cut -d'.' -f2 | cut -d'=' -f1); do
+                sm=$(uci -q get "firewall.${r}.src_mac" | tr '[:upper:]' '[:lower:]')
+                if [ "$sm" = "$MAC" ]; then
+                    uci set firewall."$r".enabled='0'
+                fi
+            done
+            uci commit firewall
+
+            printf '{"status":"ok","message":"Device unblocked."}\n'
+            (sleep 1 && /etc/init.d/firewall reload >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+        else
+            printf '{"status":"error","message":"Invalid MAC address."}'
+        fi
+        ;;
+
+    # -------------------------------------------------------------
+    # 4. WAN PROTOCOL MANAGEMENT
+    # -------------------------------------------------------------
+    get_wan)
+        PROTO=$(uci -q get network.wan.proto || echo "dhcp")
+        IPADDR=$(uci -q get network.wan.ipaddr || echo "")
+        NETMASK=$(uci -q get network.wan.netmask || echo "")
+        GATEWAY=$(uci -q get network.wan.gateway || echo "")
+        DNS=$(uci -q get network.wan.dns || echo "")
+        USERNAME=$(uci -q get network.wan.username || echo "")
+
+        printf '{"status":"ok","proto":"%s","ipaddr":"%s","netmask":"%s","gateway":"%s","dns":"%s","username":"%s"}' \
+            "$PROTO" "$IPADDR" "$NETMASK" "$GATEWAY" "$DNS" "$USERNAME"
+        ;;
+
+    set_wan)
+        BODY=$(read_body)
+        PROTO=$(echo "$BODY" | jsonfilter -e '@.proto')
+
+        if [ "$PROTO" = "dhcp" ] || [ "$PROTO" = "static" ] || [ "$PROTO" = "pppoe" ]; then
+            uci set network.wan.proto="$PROTO"
+            if [ "$PROTO" = "static" ]; then
+                uci set network.wan.ipaddr="$(echo "$BODY" | jsonfilter -e '@.ipaddr')"
+                uci set network.wan.netmask="$(echo "$BODY" | jsonfilter -e '@.netmask')"
+                uci set network.wan.gateway="$(echo "$BODY" | jsonfilter -e '@.gateway')"
+                uci -q delete network.wan.dns
+                for d in $(echo "$BODY" | jsonfilter -e '@.dns'); do
+                    uci add_list network.wan.dns="$d"
+                done
+            elif [ "$PROTO" = "pppoe" ]; then
+                uci set network.wan.username="$(echo "$BODY" | jsonfilter -e '@.username')"
+                uci set network.wan.password="$(echo "$BODY" | jsonfilter -e '@.password')"
+            fi
+            uci commit network
+
+            printf '{"status":"ok","message":"WAN protocol saved and restarting."}\n'
+            (sleep 1 && ifup wan >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+        else
+            printf '{"status":"error","message":"Unsupported protocol."}'
+        fi
+        ;;
+
+    # -------------------------------------------------------------
+    # 5. FIXED SWITCH & ANY-PORT WAN REASSIGNMENT
+    # -------------------------------------------------------------
+    get_switch)
+        ACTIVE_WAN_PORT=$(get_active_wan_port)
+        ACTIVE_WAN_NAME=$(port_to_name "$ACTIVE_WAN_PORT")
+
+        printf '{"status":"ok","active_wan_port":"%s","active_wan_name":"%s","ports":[' "$ACTIVE_WAN_PORT" "$ACTIVE_WAN_NAME"
+
+        # Correct hardware mapping for TP-Link Archer C20 (MT7628 / rt305x)
+        # 6: CPU | 1: LAN 1 | 2: LAN 2 | 3: LAN 3 | 4: LAN 4 | 0: WAN
+        port_list="6:CPU_(eth0):CPU 1:LAN_1:LAN 2:LAN_2:LAN 3:LAN_3:LAN 4:LAN_4:LAN 0:WAN:WAN"
+        first=1
+        for item in $port_list; do
+            pnum=$(echo "$item" | cut -d: -f1)
+            pname=$(echo "$item" | cut -d: -f2 | tr '_' ' ')
+            prole="LAN"
+
+            if [ "$pnum" = "6" ]; then
+                prole="CPU"
+            elif [ "$pnum" = "$ACTIVE_WAN_PORT" ]; then
+                prole="WAN"
+            fi
+
+            raw_link=$(swconfig dev switch0 port "$pnum" get link 2>/dev/null)
+            if echo "$raw_link" | grep -q "link:up"; then
+                link=1
+                speed_str=$(echo "$raw_link" | sed -n 's/.*speed:\([^ ]*\).*/\1/p')
+                duplex="FD"
+                echo "$raw_link" | grep -q "half-duplex" && duplex="HD"
+                case "$speed_str" in
+                    *1000*) speed="1000 Mbps $duplex" ;;
+                    *100*)  speed="100 Mbps $duplex" ;;
+                    *10*)   speed="10 Mbps $duplex" ;;
+                    *)      speed="$speed_str" ;;
+                esac
+            else
+                link=0
+                speed="No link"
+            fi
+
+            [ $first -eq 0 ] && printf ','
+            first=0
+            printf '{"port_num":"%s","name":"%s","role":"%s","link":%d,"speed":"%s"}' \
+                "$pnum" "$pname" "$prole" "$link" "$speed"
+        done
+        printf ']}'
+        ;;
+
+    set_switch)
+        BODY=$(read_body)
+        NEW_WAN=$(echo "$BODY" | jsonfilter -e '@.wan_port')
+
+        V1_SEC=""
+        V2_SEC=""
+        for s in $(uci show network | grep "=switch_vlan" | cut -d'.' -f2 | cut -d'=' -f1); do
+            v=$(uci -q get "network.${s}.vlan")
+            [ -z "$v" ] && v=$(uci -q get "network.${s}.vid")
+            [ "$v" = "1" ] && V1_SEC="$s"
+            [ "$v" = "2" ] && V2_SEC="$s"
+        done
+
+        if [ "$NEW_WAN" = "none" ]; then
+            # Bridge all 5 physical ports to VLAN 1 (LAN)
+            uci set network."${V1_SEC}".ports='6t 0 1 2 3 4'
+            uci set network."${V2_SEC}".ports='6t'
+            uci set network.wan.disabled='1'
+            uci -q set network.wan6.disabled='1'
+            uci commit network
+
+            printf '{"status":"ok","message":"All ports bridged to LAN switch. WAN interface disabled."}\n'
+            (sleep 1 && /etc/init.d/network restart >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+
+        elif echo "0 1 2 3 4" | grep -qw "$NEW_WAN"; then
+            # Build VLAN 1 ports by excluding the chosen WAN port
+            v1_ports="6t"
+            for p in 0 1 2 3 4; do
+                if [ "$p" != "$NEW_WAN" ]; then
+                    v1_ports="${v1_ports} ${p}"
+                fi
+            done
+
+            # Set VLAN 1 (LAN) with remaining ports, VLAN 2 with ONLY the chosen WAN port + CPU
+            uci set network."${V1_SEC}".ports="$v1_ports"
+            uci set network."${V2_SEC}".ports="6t ${NEW_WAN}"
+            uci set network.wan.disabled='0'
+            uci -q set network.wan6.disabled='0'
+            uci commit network
+
+            printf '{"status":"ok","message":"Port reassigned as WAN. Switch restarting."}\n'
+            (sleep 1 && /etc/init.d/network restart >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+        else
+            printf '{"status":"error","message":"Invalid port selection."}'
+        fi
+        ;;
+
+    *)
+        printf '{"status":"error","message":"Unknown action."}'
+        ;;
+esac
+EOF
+
+chmod +x /www/cgi-bin/api
